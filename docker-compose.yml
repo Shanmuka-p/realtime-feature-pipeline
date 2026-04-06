@@ -89,6 +89,21 @@ services:
         taskmanager.numberOfTaskSlots: 2
     networks:
       - pipeline-net
+  producer:
+    build: ./producer
+    container_name: data-producer
+    depends_on:
+      kafka:
+        condition: service_healthy
+    environment:
+      - KAFKA_BROKER=kafka:29092
+      - TOPIC_USER_EVENTS=${TOPIC_USER_EVENTS:-user-events}
+      - TOPIC_CONTENT_METADATA=${TOPIC_CONTENT_METADATA:-content-metadata}
+      - TOPIC_FEATURE_STORE=${TOPIC_FEATURE_STORE:-feature-store}
+    volumes:
+      - ./submission.json:/submission.json:ro
+    networks:
+      - pipeline-net
 
 networks:
   pipeline-net:
