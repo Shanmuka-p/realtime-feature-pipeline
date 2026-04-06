@@ -1,0 +1,21 @@
+# Environments
+.env
+.venv/
+venv/
+env/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Java / Maven (For Flink later)
+target/
+*.class
+*.jar
+.idea/
+*.iml
+
+# OS generated files
+.DS_Store
+Thumbs.db
