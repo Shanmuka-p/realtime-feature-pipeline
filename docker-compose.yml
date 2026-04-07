@@ -104,6 +104,16 @@ services:
       - ./submission.json:/submission.json:ro
     networks:
       - pipeline-net
+  flink-job-submitter:
+    build: ./flink-processor
+    container_name: flink-job-submitter
+    depends_on:
+      flink-taskmanager:
+        condition: service_started
+      kafka:
+        condition: service_healthy
+    networks:
+      - pipeline-net
 
 networks:
   pipeline-net:
