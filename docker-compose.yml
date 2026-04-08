@@ -114,6 +114,19 @@ services:
         condition: service_healthy
     networks:
       - pipeline-net
+  dashboard:
+    build: ./dashboard
+    container_name: observability-dashboard
+    depends_on:
+      kafka:
+        condition: service_healthy
+    ports:
+      - "8000:8000"
+    environment:
+      - KAFKA_BROKER=kafka:29092
+      - TOPIC_FEATURE_STORE=${TOPIC_FEATURE_STORE:-feature-store}
+    networks:
+      - pipeline-net    
 
 networks:
   pipeline-net:
