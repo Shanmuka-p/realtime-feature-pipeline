@@ -1,23 +1,60 @@
 <!DOCTYPE html>
 <html>
+
 <head>
     <title>Real-Time ML Feature Store</title>
     <style>
-        body { font-family: Arial, sans-serif; margin: 40px; background-color: #f4f4f9; }
-        .container { max-width: 800px; margin: auto; background: white; padding: 20px; border-radius: 8px; box-shadow: 0 4px 8px rgba(0,0,0,0.1); }
-        .metrics-grid { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 15px; margin-top: 20px; }
-        .metric-card { background: #e0e7ff; padding: 15px; border-radius: 5px; text-align: center; }
-        .feature-list { margin-top: 20px; border-top: 1px solid #ccc; padding-top: 20px; }
-        .feature-item { background: #f9fafb; padding: 10px; margin-bottom: 10px; border-left: 4px solid #4f46e5; }
+        body {
+            font-family: Arial, sans-serif;
+            margin: 40px;
+            background-color: #f4f4f9;
+        }
+
+        .container {
+            max-width: 800px;
+            margin: auto;
+            background: white;
+            padding: 20px;
+            border-radius: 8px;
+            box-shadow: 0 4px 8px rgba(0, 0, 0, 0.1);
+        }
+
+        .metrics-grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr 1fr;
+            gap: 15px;
+            margin-top: 20px;
+        }
+
+        .metric-card {
+            background: #e0e7ff;
+            padding: 15px;
+            border-radius: 5px;
+            text-align: center;
+        }
+
+        .feature-list {
+            margin-top: 20px;
+            border-top: 1px solid #ccc;
+            padding-top: 20px;
+        }
+
+        .feature-item {
+            background: #f9fafb;
+            padding: 10px;
+            margin-bottom: 10px;
+            border-left: 4px solid #4f46e5;
+        }
     </style>
 </head>
+
 <body>
     <div class="container">
         <h2>Feature Pipeline Observability Dashboard</h2>
-        
+
         <label for="entityId"><strong>Enter User ID or Content ID:</strong></label>
         <input type="text" id="entityId" placeholder="e.g., user_123" onkeyup="filterFeatures()">
-        
+
         <div class="metrics-grid">
             <div class="metric-card">
                 <h4>Feature Freshness (ms)</h4>
@@ -25,29 +62,37 @@
             </div>
             <div class="metric-card">
                 <h4>Late Events Dropped</h4>
-                <div id="lateEventsMetric">-</div> </div>
+                <div id="lateEventsMetric">-</div>
+            </div>
             <div class="metric-card">
                 <h4>Watermark Lag (ms)</h4>
-                <div id="watermarkMetric">-</div> </div>
+                <div id="watermarkMetric">-</div>
+            </div>
         </div>
 
         <div class="feature-list" id="featureContainer">
             <h3>Latest Features</h3>
-            </div>
+        </div>
     </div>
 
     <script>
         const ws = new WebSocket(`ws://${location.host}/ws`);
         const featureStore = {}; // Holds latest features for UI
 
-        ws.onmessage = function(event) {
+        ws.onmessage = function (event) {
             const data = JSON.parse(event.data);
-            featureStore[data.feature_name] = data;
-            
-            // Note: In a full integration, late events and watermark lag would be pushed here too.
-            // For now, we update freshness directly from the feature metadata.
-            document.getElementById('freshnessMetric').innerText = `${data.freshness_ms} ms`;
-            
+
+            // FIX: Use a composite key so different entities don't overwrite each other's features
+            const storeKey = `${data.entity_id}_${data.feature_name}`;
+            featureStore[storeKey] = data;
+
+            const searchId = document.getElementById('entityId').value.trim();
+
+            // Only update the freshness metric if it belongs to the user we are currently searching for
+            if (searchId === "" || data.entity_id === searchId) {
+                document.getElementById('freshnessMetric').innerText = `${data.freshness_ms} ms`;
+            }
+
             updateUI();
         };
 
@@ -60,7 +105,7 @@
             const container = document.getElementById('featureContainer');
             container.innerHTML = '<h3>Latest Features</h3>';
 
-            for (const [featName, featData] of Object.entries(featureStore)) {
+            for (const [key, featData] of Object.entries(featureStore)) {
                 // If search input is active, filter by entity_id
                 if (searchId === "" || featData.entity_id === searchId) {
                     const div = document.createElement('div');
@@ -73,4 +118,5 @@
         }
     </script>
 </body>
+
 </html>
