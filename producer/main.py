@@ -69,11 +69,17 @@ def publish_metadata(producer):
     print("Published content metadata.")
 
 def generate_user_events(producer):
-    """Simulate continuous user activity with 5% late events."""
+    """Simulate continuous user activity with accelerated time and 5% late events."""
     print("Starting continuous event generation...")
+    
+    # Initialize a simulated clock
+    simulated_clock = datetime.utcnow()
+    
     while True:
-        # Calculate event timestamp
-        event_time = datetime.utcnow()
+        # ACCELERATED TIME: Advance the clock by 2 minutes for every event.
+        # This forces a 1-hour Flink window to close in just a few seconds of real time.
+        simulated_clock += timedelta(minutes=2)
+        event_time = simulated_clock
         
         # 5% chance to create a deliberately late event (35-90 seconds in the past)
         if random.random() < 0.05:
@@ -90,9 +96,7 @@ def generate_user_events(producer):
         }
         
         producer.send(TOPIC_USER_EVENTS, value=event)
-        
-        # Accelerated time: Sleep briefly between events
-        time.sleep(random.uniform(0.1, 0.5))
+        time.sleep(random.uniform(0.1, 0.3))
 
 if __name__ == "__main__":
     # Wait for Kafka to be ready
