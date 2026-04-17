@@ -14,6 +14,12 @@ import org.apache.flink.streaming.api.windowing.time.Time;
 import org.apache.flink.api.common.functions.AggregateFunction;
 import org.apache.flink.api.common.functions.FlatMapFunction;
 import org.apache.flink.util.Collector;
+import org.apache.flink.api.common.typeinfo.Types;
+import org.apache.flink.types.Row;
+import org.apache.flink.table.api.bridge.java.StreamTableEnvironment;
+import org.apache.flink.table.api.Table;
+import org.apache.flink.table.api.Schema;
+import org.apache.flink.table.api.DataTypes;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
@@ -27,11 +33,12 @@ public class FeatureEngineeringJob {
 
     public static void main(String[] args) throws Exception {
         final StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
+        StreamTableEnvironment tableEnv = StreamTableEnvironment.create(env);
         ObjectMapper mapper = new ObjectMapper();
 
         String brokers = System.getenv().getOrDefault("KAFKA_BROKER", "kafka:29092");
 
-        // 1. Setup Kafka Source (user-events)
+        // 1. Setup Kafka Source
         KafkaSource<String> source = KafkaSource.<String>builder()
                 .setBootstrapServers(brokers)
                 .setTopics("user-events")
@@ -40,7 +47,7 @@ public class FeatureEngineeringJob {
                 .setValueOnlyDeserializer(new SimpleStringSchema())
                 .build();
 
-        // 2. Setup Kafka Sink (feature-store)
+        // 2. Setup Kafka Sink
         KafkaSink<String> sink = KafkaSink.<String>builder()
                 .setBootstrapServers(brokers)
                 .setRecordSerializer(KafkaRecordSerializationSchema.builder()
@@ -49,7 +56,7 @@ public class FeatureEngineeringJob {
                         .build())
                 .build();
 
-        // 3. Ingest Data and Apply strict 30-Second Watermark
+        // 3. Ingest Data and Apply Watermarks
         DataStream<JsonNode> eventStream = env.fromSource(
                 source,
                 WatermarkStrategy.<String>forBoundedOutOfOrderness(Duration.ofSeconds(30))
@@ -63,7 +70,7 @@ public class FeatureEngineeringJob {
                         }),
                 "Kafka Source").map(mapper::readTree);
 
-        // 4. Calculate User Features (1-Hour Tumbling Window)
+        // 4. User Features (Tumbling Window)
         eventStream
                 .keyBy(json -> json.get("user_id").asText())
                 .window(TumblingEventTimeWindows.of(Time.hours(1)))
@@ -78,19 +85,79 @@ public class FeatureEngineeringJob {
                 })
                 .sinkTo(sink);
 
-        // 5. Calculate Content Features (15-Min Sliding Window, 5-Min Slide)
+        // 5. Content Features (Sliding Window)
         eventStream
                 .keyBy(json -> json.get("content_id").asText())
                 .window(SlidingEventTimeWindows.of(Time.minutes(15), Time.minutes(5)))
                 .aggregate(new ContentFeatureAggregator())
                 .sinkTo(sink);
 
+        // ==========================================
+        // 6. Stream-Table Join: Category Affinity
+        // ==========================================
+
+        // Convert JSON to strongly typed Row for Flink SQL
+        DataStream<Row> typedEventStream = eventStream.map(json -> Row.of(
+                json.get("user_id").asText(),
+                json.get("content_id").asText()))
+                .returns(Types.ROW_NAMED(new String[] { "user_id", "content_id" }, Types.STRING, Types.STRING));
+
+        // Define Schema with PROCTIME
+        Schema eventSchema = Schema.newBuilder()
+                .column("user_id", DataTypes.STRING())
+                .column("content_id", DataTypes.STRING())
+                .columnByExpression("proctime", "PROCTIME()")
+                .build();
+
+        tableEnv.createTemporaryView("user_events", typedEventStream, eventSchema);
+
+        // Define Content Metadata Table (REMOVED PRIMARY KEY)
+        tableEnv.executeSql(
+                "CREATE TABLE content_metadata (" +
+                        "  content_id STRING," +
+                        "  category STRING" +
+                        ") WITH (" +
+                        "  'connector' = 'kafka'," +
+                        "  'topic' = 'content-metadata'," +
+                        "  'properties.bootstrap.servers' = '" + brokers + "'," +
+                        "  'properties.group.id' = 'metadata-enrichment-group'," +
+                        "  'format' = 'json'," +
+                        "  'scan.startup.mode' = 'earliest-offset'" +
+                        ")");
+
+        // Execute Join and Aggregate
+        Table affinityTable = tableEnv.sqlQuery(
+                "SELECT " +
+                        "  u.user_id AS entity_id, " +
+                        "  'affinity_' || m.category AS feature_name, " +
+                        "  CAST(COUNT(*) AS STRING) AS feature_value, " +
+                        "  CAST(CURRENT_TIMESTAMP AS STRING) AS computed_at " +
+                        "FROM user_events u " +
+                        "JOIN content_metadata m " +
+                        "ON u.content_id = m.content_id " +
+                        "GROUP BY u.user_id, m.category");
+
+        // Safely extract INSERT and UPDATE_AFTER records from the Changelog Stream
+        tableEnv.toChangelogStream(affinityTable)
+                .filter(row -> {
+                    org.apache.flink.types.RowKind kind = row.getKind();
+                    return kind == org.apache.flink.types.RowKind.INSERT
+                            || kind == org.apache.flink.types.RowKind.UPDATE_AFTER;
+                })
+                .map(row -> {
+                    ObjectNode json = mapper.createObjectNode();
+                    json.put("entity_id", (String) row.getField("entity_id"));
+                    json.put("feature_name", (String) row.getField("feature_name"));
+                    json.put("feature_value", (String) row.getField("feature_value"));
+                    json.put("computed_at", (String) row.getField("computed_at"));
+                    return json.toString();
+                })
+                .sinkTo(sink);
+
         env.execute("Real-Time Feature Engineering Pipeline");
     }
 
-    // ==========================================
-    // Aggregator 1: User Features (click_rate, avg_dwell_time)
-    // ==========================================
+    // --- Aggregators ---
     public static class UserFeatureAcc {
         public String userId = "";
         public long totalEvents = 0;
@@ -110,7 +177,6 @@ public class FeatureEngineeringJob {
         public UserFeatureAcc add(JsonNode value, UserFeatureAcc acc) {
             acc.userId = value.get("user_id").asText();
             acc.totalEvents++;
-
             if ("click".equals(value.get("event_type").asText())) {
                 acc.clicks++;
             }
@@ -125,21 +191,19 @@ public class FeatureEngineeringJob {
             List<String> results = new ArrayList<>();
             String now = Instant.now().toString();
 
-            // Feature: click_rate
             ObjectNode clickRateNode = mapper.createObjectNode();
             clickRateNode.put("entity_id", acc.userId);
             clickRateNode.put("feature_name", "click_rate");
-            double rate = acc.totalEvents > 0 ? (double) acc.clicks / acc.totalEvents : 0.0;
-            clickRateNode.put("feature_value", String.format("%.2f", rate));
+            clickRateNode.put("feature_value",
+                    String.format("%.2f", acc.totalEvents > 0 ? (double) acc.clicks / acc.totalEvents : 0.0));
             clickRateNode.put("computed_at", now);
             results.add(clickRateNode.toString());
 
-            // Feature: avg_dwell_time
             ObjectNode dwellTimeNode = mapper.createObjectNode();
             dwellTimeNode.put("entity_id", acc.userId);
             dwellTimeNode.put("feature_name", "avg_dwell_time");
-            double avgDwell = acc.totalEvents > 0 ? (double) acc.totalDwellTimeMs / acc.totalEvents : 0.0;
-            dwellTimeNode.put("feature_value", String.format("%.2f", avgDwell));
+            dwellTimeNode.put("feature_value",
+                    String.format("%.2f", acc.totalEvents > 0 ? (double) acc.totalDwellTimeMs / acc.totalEvents : 0.0));
             dwellTimeNode.put("computed_at", now);
             results.add(dwellTimeNode.toString());
 
@@ -155,13 +219,10 @@ public class FeatureEngineeringJob {
         }
     }
 
-    // ==========================================
-    // Aggregator 2: Content Features (engagement_rate)
-    // ==========================================
     public static class ContentFeatureAcc {
         public String contentId = "";
         public long views = 0;
-        public long engagements = 0; // likes + shares
+        public long engagements = 0;
     }
 
     public static class ContentFeatureAggregator implements AggregateFunction<JsonNode, ContentFeatureAcc, String> {
@@ -176,7 +237,6 @@ public class FeatureEngineeringJob {
         public ContentFeatureAcc add(JsonNode value, ContentFeatureAcc acc) {
             acc.contentId = value.get("content_id").asText();
             String eventType = value.get("event_type").asText();
-
             if ("view".equals(eventType)) {
                 acc.views++;
             } else if ("like".equals(eventType) || "share".equals(eventType)) {
@@ -190,11 +250,8 @@ public class FeatureEngineeringJob {
             ObjectNode result = mapper.createObjectNode();
             result.put("entity_id", acc.contentId);
             result.put("feature_name", "engagement_rate");
-
-            // Formula: (likes + shares) / views. Handle div by zero.
-            double engagementRate = acc.views > 0 ? (double) acc.engagements / acc.views : 0.0;
-
-            result.put("feature_value", String.format("%.2f", engagementRate));
+            result.put("feature_value",
+                    String.format("%.2f", acc.views > 0 ? (double) acc.engagements / acc.views : 0.0));
             result.put("computed_at", Instant.now().toString());
             return result.toString();
         }
