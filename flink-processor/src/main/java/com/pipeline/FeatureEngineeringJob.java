@@ -11,11 +11,17 @@ import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
 import org.apache.flink.streaming.api.windowing.assigners.TumblingEventTimeWindows;
 import org.apache.flink.streaming.api.windowing.assigners.SlidingEventTimeWindows;
 import org.apache.flink.streaming.api.windowing.time.Time;
+import org.apache.flink.api.common.functions.AggregateFunction;
+import org.apache.flink.api.common.functions.FlatMapFunction;
+import org.apache.flink.util.Collector;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ObjectNode;
 
 import java.time.Duration;
 import java.time.Instant;
+import java.util.ArrayList;
+import java.util.List;
 
 public class FeatureEngineeringJob {
 
@@ -25,7 +31,7 @@ public class FeatureEngineeringJob {
 
         String brokers = System.getenv().getOrDefault("KAFKA_BROKER", "kafka:29092");
 
-        // 1. Define Kafka Source for user-events
+        // 1. Setup Kafka Source (user-events)
         KafkaSource<String> source = KafkaSource.<String>builder()
                 .setBootstrapServers(brokers)
                 .setTopics("user-events")
@@ -34,44 +40,170 @@ public class FeatureEngineeringJob {
                 .setValueOnlyDeserializer(new SimpleStringSchema())
                 .build();
 
-        // 2. Parse JSON and Assign Watermarks (30-second bounded out-of-orderness)
+        // 2. Setup Kafka Sink (feature-store)
+        KafkaSink<String> sink = KafkaSink.<String>builder()
+                .setBootstrapServers(brokers)
+                .setRecordSerializer(KafkaRecordSerializationSchema.builder()
+                        .setTopic("feature-store")
+                        .setValueSerializationSchema(new SimpleStringSchema())
+                        .build())
+                .build();
+
+        // 3. Ingest Data and Apply strict 30-Second Watermark
         DataStream<JsonNode> eventStream = env.fromSource(
                 source,
                 WatermarkStrategy.<String>forBoundedOutOfOrderness(Duration.ofSeconds(30))
                         .withTimestampAssigner((eventStr, timestamp) -> {
                             try {
                                 JsonNode node = mapper.readTree(eventStr);
-                                String timeStr = node.get("timestamp").asText();
-                                return Instant.parse(timeStr).toEpochMilli();
+                                return Instant.parse(node.get("timestamp").asText()).toEpochMilli();
                             } catch (Exception e) {
                                 return System.currentTimeMillis();
                             }
                         }),
-                "Kafka Source"
-        ).map(mapper::readTree);
+                "Kafka Source").map(mapper::readTree);
 
-        // 3. User Features (1-Hour Tumbling Window)
-        // Computes click_rate and avg_dwell_time
-        /* eventStream.keyBy(json -> json.get("user_id").asText())
+        // 4. Calculate User Features (1-Hour Tumbling Window)
+        eventStream
+                .keyBy(json -> json.get("user_id").asText())
                 .window(TumblingEventTimeWindows.of(Time.hours(1)))
-                .aggregate(new UserFeatureAggregator()) 
-                .sinkTo(featureSink);
-        */
+                .aggregate(new UserFeatureAggregator())
+                .flatMap(new FlatMapFunction<List<String>, String>() {
+                    @Override
+                    public void flatMap(List<String> values, Collector<String> out) {
+                        for (String msg : values) {
+                            out.collect(msg);
+                        }
+                    }
+                })
+                .sinkTo(sink);
 
-        // 4. Content Features (15-Min Sliding Window, 5-Min Slide)
-        // Computes engagement_rate
-        /*
-        eventStream.keyBy(json -> json.get("content_id").asText())
+        // 5. Calculate Content Features (15-Min Sliding Window, 5-Min Slide)
+        eventStream
+                .keyBy(json -> json.get("content_id").asText())
                 .window(SlidingEventTimeWindows.of(Time.minutes(15), Time.minutes(5)))
                 .aggregate(new ContentFeatureAggregator())
-                .sinkTo(featureSink);
-        */
+                .sinkTo(sink);
 
-        // 5. Stream-Table Join (Enrichment)
-        // Computes category_affinity_score
-        // (You would set up a StreamTableEnvironment here, define the content-metadata topic as a Table, 
-        // and execute a temporal join or lookup join using Flink SQL).
+        env.execute("Real-Time Feature Engineering Pipeline");
+    }
 
-        env.execute("Real-Time Feature Engineering Job");
+    // ==========================================
+    // Aggregator 1: User Features (click_rate, avg_dwell_time)
+    // ==========================================
+    public static class UserFeatureAcc {
+        public String userId = "";
+        public long totalEvents = 0;
+        public long clicks = 0;
+        public long totalDwellTimeMs = 0;
+    }
+
+    public static class UserFeatureAggregator implements AggregateFunction<JsonNode, UserFeatureAcc, List<String>> {
+        private static final ObjectMapper mapper = new ObjectMapper();
+
+        @Override
+        public UserFeatureAcc createAccumulator() {
+            return new UserFeatureAcc();
+        }
+
+        @Override
+        public UserFeatureAcc add(JsonNode value, UserFeatureAcc acc) {
+            acc.userId = value.get("user_id").asText();
+            acc.totalEvents++;
+
+            if ("click".equals(value.get("event_type").asText())) {
+                acc.clicks++;
+            }
+            if (value.has("dwell_time_ms")) {
+                acc.totalDwellTimeMs += value.get("dwell_time_ms").asLong();
+            }
+            return acc;
+        }
+
+        @Override
+        public List<String> getResult(UserFeatureAcc acc) {
+            List<String> results = new ArrayList<>();
+            String now = Instant.now().toString();
+
+            // Feature: click_rate
+            ObjectNode clickRateNode = mapper.createObjectNode();
+            clickRateNode.put("entity_id", acc.userId);
+            clickRateNode.put("feature_name", "click_rate");
+            double rate = acc.totalEvents > 0 ? (double) acc.clicks / acc.totalEvents : 0.0;
+            clickRateNode.put("feature_value", String.format("%.2f", rate));
+            clickRateNode.put("computed_at", now);
+            results.add(clickRateNode.toString());
+
+            // Feature: avg_dwell_time
+            ObjectNode dwellTimeNode = mapper.createObjectNode();
+            dwellTimeNode.put("entity_id", acc.userId);
+            dwellTimeNode.put("feature_name", "avg_dwell_time");
+            double avgDwell = acc.totalEvents > 0 ? (double) acc.totalDwellTimeMs / acc.totalEvents : 0.0;
+            dwellTimeNode.put("feature_value", String.format("%.2f", avgDwell));
+            dwellTimeNode.put("computed_at", now);
+            results.add(dwellTimeNode.toString());
+
+            return results;
+        }
+
+        @Override
+        public UserFeatureAcc merge(UserFeatureAcc a, UserFeatureAcc b) {
+            a.totalEvents += b.totalEvents;
+            a.clicks += b.clicks;
+            a.totalDwellTimeMs += b.totalDwellTimeMs;
+            return a;
+        }
+    }
+
+    // ==========================================
+    // Aggregator 2: Content Features (engagement_rate)
+    // ==========================================
+    public static class ContentFeatureAcc {
+        public String contentId = "";
+        public long views = 0;
+        public long engagements = 0; // likes + shares
+    }
+
+    public static class ContentFeatureAggregator implements AggregateFunction<JsonNode, ContentFeatureAcc, String> {
+        private static final ObjectMapper mapper = new ObjectMapper();
+
+        @Override
+        public ContentFeatureAcc createAccumulator() {
+            return new ContentFeatureAcc();
+        }
+
+        @Override
+        public ContentFeatureAcc add(JsonNode value, ContentFeatureAcc acc) {
+            acc.contentId = value.get("content_id").asText();
+            String eventType = value.get("event_type").asText();
+
+            if ("view".equals(eventType)) {
+                acc.views++;
+            } else if ("like".equals(eventType) || "share".equals(eventType)) {
+                acc.engagements++;
+            }
+            return acc;
+        }
+
+        @Override
+        public String getResult(ContentFeatureAcc acc) {
+            ObjectNode result = mapper.createObjectNode();
+            result.put("entity_id", acc.contentId);
+            result.put("feature_name", "engagement_rate");
+
+            // Formula: (likes + shares) / views. Handle div by zero.
+            double engagementRate = acc.views > 0 ? (double) acc.engagements / acc.views : 0.0;
+
+            result.put("feature_value", String.format("%.2f", engagementRate));
+            result.put("computed_at", Instant.now().toString());
+            return result.toString();
+        }
+
+        @Override
+        public ContentFeatureAcc merge(ContentFeatureAcc a, ContentFeatureAcc b) {
+            a.views += b.views;
+            a.engagements += b.engagements;
+            return a;
+        }
     }
 }
