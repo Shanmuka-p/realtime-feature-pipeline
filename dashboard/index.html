@@ -82,13 +82,16 @@
         ws.onmessage = function (event) {
             const data = JSON.parse(event.data);
 
-            // FIX: Use a composite key so different entities don't overwrite each other's features
+            if (data.type === "METRICS") {
+                document.getElementById('lateEventsMetric').innerText = data.late_dropped;
+                document.getElementById('watermarkMetric').innerText = data.watermark_lag_ms;
+                return; // Exit early, this isn't a feature update
+            }
+
             const storeKey = `${data.entity_id}_${data.feature_name}`;
             featureStore[storeKey] = data;
 
             const searchId = document.getElementById('entityId').value.trim();
-
-            // Only update the freshness metric if it belongs to the user we are currently searching for
             if (searchId === "" || data.entity_id === searchId) {
                 document.getElementById('freshnessMetric').innerText = `${data.freshness_ms} ms`;
             }
