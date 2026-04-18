@@ -76,16 +76,14 @@ def generate_user_events(producer):
     simulated_clock = datetime.utcnow()
     
     while True:
-        # ACCELERATED TIME: Advance the clock by 2 minutes for every event.
-        # This forces a 1-hour Flink window to close in just a few seconds of real time.
-        simulated_clock += timedelta(minutes=2)
+        # HYPER-DRIVE: Advance clock by 1 minute per event!
+        simulated_clock += timedelta(minutes=1)
         event_time = simulated_clock
         
         # 5% chance to create a deliberately late event (35-90 seconds in the past)
         if random.random() < 0.05:
             delay_seconds = random.randint(35, 90)
             event_time = event_time - timedelta(seconds=delay_seconds)
-            print(f"Produced LATE event (delayed by {delay_seconds}s)")
 
         event = {
             "user_id": random.choice(USERS),
@@ -96,7 +94,9 @@ def generate_user_events(producer):
         }
         
         producer.send(TOPIC_USER_EVENTS, value=event)
-        time.sleep(random.uniform(0.1, 0.3))
+        
+        # Fire events as fast as possible (0.01 seconds)
+        time.sleep(0.01)
 
 if __name__ == "__main__":
     # Wait for Kafka to be ready
